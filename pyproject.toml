@@ -1,0 +1,17 @@
+[project]
+name = "finance-digest"
+version = "0.1.0"
+description = "Manual Telegram finance chat collector and Codex summarizer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PyYAML>=6.0.2",
+    "telethon>=1.40.0",
+]
+
+[project.scripts]
+finance-digest = "finance_digest.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

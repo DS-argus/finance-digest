@@ -1,0 +1,45 @@
+# Copy to config.yml and fill the chat list.
+# Secrets are read from environment variables or from env_file.
+
+env_file: .env
+
+telegram:
+  api_id_env: TELEGRAM_API_ID
+  api_hash_env: TELEGRAM_API_HASH
+  phone_env: TELEGRAM_PHONE
+  session_path: data/telegram
+
+chats:
+  - name: Example Finance Channel
+    identifier: example_channel_username_or_chat_id
+    enabled: false
+
+collection:
+  timezone: Asia/Seoul
+  recent_hours: 24
+  monday_weekend: true
+  output_dir: data/collections
+
+summary:
+  output_dir: data/reports
+  provider: claude
+  prompt_file: summary_prompt.yml
+  claude:
+    command: claude
+    model: ""
+    no_session_persistence: true
+    tools: ""
+  codex:
+    command: codex
+    model: ""
+    sandbox: read-only
+    ephemeral: true
+    skip_git_repo_check: true
+
+send:
+  telegram:
+    enabled: false
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    delivery_chat_id_env: TELEGRAM_DELIVERY_CHAT_ID
+    disable_web_page_preview: true
+    max_chars: 3900
