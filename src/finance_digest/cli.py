@@ -97,17 +97,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     collection = asyncio.run(collect_messages(config, window))
     _print_collection_summary(collection)
 
-    report = summarize_collection(config, collection)
-
     if args.dry_run:
+        report = summarize_collection(config, collection)
         print()
         print(report)
         return 0
 
     json_path, markdown_path = _write_collection(config, collection)
-    report_path = _write_report(config, collection, report)
     print(f"Wrote collection JSON: {json_path}")
     print(f"Wrote collection Markdown: {markdown_path}")
+
+    report = summarize_collection(config, collection)
+    report_path = _write_report(config, collection, report)
     print(f"Wrote report: {report_path}")
 
     if config.send.telegram.enabled:

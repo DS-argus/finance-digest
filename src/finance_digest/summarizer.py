@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -21,7 +23,16 @@ def summarize_collection(config: AppConfig, collection: dict[str, Any]) -> str:
         return NO_MESSAGES_REPORT
 
     if config.summary.provider == "claude":
-        return _summarize_with_claude(config, collection)
+        try:
+            return _summarize_with_claude(config, collection)
+        except RuntimeError as claude_error:
+            try:
+                return _summarize_with_codex(config, collection)
+            except RuntimeError as codex_error:
+                raise RuntimeError(
+                    "claude summarizer failed and codex fallback also failed: "
+                    f"claude: {claude_error}; codex: {codex_error}"
+                ) from codex_error
     if config.summary.provider == "codex":
         return _summarize_with_codex(config, collection)
     raise RuntimeError(f"Unsupported summary provider: {config.summary.provider}")
@@ -76,6 +87,7 @@ def _run_summarizer(
     *,
     provider: str,
 ) -> str:
+    cmd = [_resolve_command(cmd[0], provider), *cmd[1:]]
     proc = subprocess.run(
         cmd,
         input=input_text,
@@ -85,9 +97,34 @@ def _run_summarizer(
         check=False,
     )
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()
-        raise RuntimeError(f"{provider} summarizer failed with code {proc.returncode}: {stderr}")
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(
+            f"{provider} summarizer failed with code {proc.returncode}: {detail}"
+        )
     return proc.stdout.strip()
+
+
+def _resolve_command(command: str, provider: str) -> str:
+    if os.path.sep in command:
+        return command
+
+    search_path = os.pathsep.join(
+        [
+            os.environ.get("PATH", ""),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            str(Path.home() / ".local/bin"),
+            str(Path.home() / ".npm-global/bin"),
+        ]
+    )
+    resolved = shutil.which(command, path=search_path)
+    if resolved:
+        return resolved
+
+    raise RuntimeError(
+        f"Could not find summarizer command '{command}'. "
+        f"Set summary.{provider}.command to an absolute path or install it on PATH."
+    )
 
 
 def format_collection_markdown(collection: dict[str, Any]) -> str:

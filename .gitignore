@@ -21,3 +21,4 @@ scripts/
 docs/
 *.session
 *.session-journal
+.gjc/
