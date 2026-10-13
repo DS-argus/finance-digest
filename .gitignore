@@ -1,24 +1,26 @@
+# Secrets and personal config
 .env
 config.yml
-.venv/
-.omc/
-.omx/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-dist/
-build/
-*.egg-info/
-.DS_Store
-
-data/
-logs/
-scripts/
-docs/
 *.session
 *.session-journal
+
+# Runtime output: collections, reports, cursors, Telegram session
+data/
+logs/
+
+# Local-only launchd setup and notes
+scripts/
+docs/
+
+# Python
+__pycache__/
+.venv/
+.ruff_cache/
+dist/
+
+# OS and local tool state
+.DS_Store
+.archify/
 .gjc/
+.omc/
+.omx/
