@@ -27,6 +27,11 @@ class ChatConfig:
     identifier: str | int
     enabled: bool = True
 
+    @property
+    def key(self) -> str:
+        """Stable state key: `@name`/`name` and `"-100…"`/`-100…` map to one key."""
+        return str(normalize_chat_identifier(self.identifier))
+
 
 @dataclass(frozen=True)
 class CollectionConfig:
@@ -34,23 +39,19 @@ class CollectionConfig:
     recent_hours: int
     monday_weekend: bool
     output_dir: Path
-
-
-@dataclass(frozen=True)
-class CodexConfig:
-    command: str
-    model: str | None
-    sandbox: str | None
-    ephemeral: bool
-    skip_git_repo_check: bool
+    state_file: Path
 
 
 @dataclass(frozen=True)
 class ClaudeConfig:
     command: str
     model: str | None
-    no_session_persistence: bool
-    tools: str | None
+
+
+@dataclass(frozen=True)
+class CodexConfig:
+    command: str
+    model: str | None
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ class SummaryConfig:
     provider: str
     prompt_file: Path
     prompt: str
+    timeout_seconds: int
     claude: ClaudeConfig
     codex: CodexConfig
 
@@ -80,7 +82,6 @@ class SendConfig:
 @dataclass(frozen=True)
 class AppConfig:
     path: Path
-    base_dir: Path
     telegram: TelegramConfig
     chats: list[ChatConfig]
     collection: CollectionConfig
@@ -160,7 +161,6 @@ def load_config(path: str | Path) -> AppConfig:
 
     return AppConfig(
         path=config_path,
-        base_dir=config_path.parent,
         telegram=TelegramConfig(
             api_id_env=str(telegram_raw.get("api_id_env", "TELEGRAM_API_ID")),
             api_hash_env=str(telegram_raw.get("api_hash_env", "TELEGRAM_API_HASH")),
@@ -177,6 +177,9 @@ def load_config(path: str | Path) -> AppConfig:
             output_dir=_resolve_path(
                 config_path.parent, str(collection_raw.get("output_dir", "data/collections"))
             ),
+            state_file=_resolve_path(
+                config_path.parent, str(collection_raw.get("state_file", "data/state.json"))
+            ),
         ),
         summary=SummaryConfig(
             output_dir=_resolve_path(
@@ -185,20 +188,16 @@ def load_config(path: str | Path) -> AppConfig:
             provider=provider,
             prompt_file=prompt_file,
             prompt=_load_prompt_file(prompt_file),
+            timeout_seconds=_positive_int(
+                summary_raw.get("timeout_seconds", 600), "summary.timeout_seconds"
+            ),
             claude=ClaudeConfig(
                 command=str(claude_raw.get("command", "claude")),
                 model=_optional_str(claude_raw.get("model")),
-                no_session_persistence=bool(
-                    claude_raw.get("no_session_persistence", True)
-                ),
-                tools=_optional_cli_arg(claude_raw.get("tools")),
             ),
             codex=CodexConfig(
                 command=str(codex_raw.get("command", "codex")),
                 model=_optional_str(codex_raw.get("model")),
-                sandbox=_optional_str(codex_raw.get("sandbox", "read-only")),
-                ephemeral=bool(codex_raw.get("ephemeral", True)),
-                skip_git_repo_check=bool(codex_raw.get("skip_git_repo_check", True)),
             ),
         ),
         send=SendConfig(
@@ -285,10 +284,14 @@ def _optional_str(value: Any) -> str | None:
     return text or None
 
 
-def _optional_cli_arg(value: Any) -> str | None:
-    if value is None:
-        return None
-    return str(value)
+def _positive_int(value: Any, name: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be a positive integer") from exc
+    if number <= 0:
+        raise ConfigError(f"{name} must be a positive integer")
+    return number
 
 
 def _required_text(value: Any, name: str) -> str:

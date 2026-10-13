@@ -3,11 +3,13 @@ from __future__ import annotations
 import html
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from finance_digest.config import AppConfig
+from finance_digest.guard import ensure_no_secrets, redact_secrets
 
 _MD_CODE_RE = re.compile(r"`([^`\n]+)`")
 _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -15,8 +17,20 @@ _MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
 _MD_HR_RE = re.compile(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$")
 
+_SEND_ATTEMPTS = 3
+_RETRY_BASE_DELAY_SECONDS = 2.0
+_MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+class _RetryableSendError(Exception):
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 def send_telegram_report(config: AppConfig, text: str) -> int:
+    # Last line of defense: nothing the summarizer produced may carry a credential out.
+    ensure_no_secrets(config, text)
     token = config.bot_token()
     chat_id = config.delivery_chat_id()
     chunks = split_for_telegram(
@@ -29,8 +43,20 @@ def send_telegram_report(config: AppConfig, text: str) -> int:
             chat_id=chat_id,
             text=prefix + chunk,
             disable_web_page_preview=config.send.telegram.disable_web_page_preview,
+            parse_mode="HTML",
         )
     return len(chunks)
+
+
+def send_failure_alert(config: AppConfig, text: str) -> None:
+    """Send a short plain-text alert; credentials are masked instead of blocking it."""
+    _send_message(
+        token=config.bot_token(),
+        chat_id=config.delivery_chat_id(),
+        text=redact_secrets(config, text)[: config.send.telegram.max_chars],
+        disable_web_page_preview=True,
+        parse_mode=None,
+    )
 
 
 def markdown_to_telegram_html(text: str) -> str:
@@ -123,28 +149,54 @@ def _send_message(
     chat_id: str,
     text: str,
     disable_web_page_preview: bool,
+    parse_mode: str | None,
 ) -> None:
+    fields = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": "true" if disable_web_page_preview else "false",
+    }
+    if parse_mode:
+        fields["parse_mode"] = parse_mode
+    payload = urllib.parse.urlencode(fields).encode("utf-8")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = urllib.parse.urlencode(
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true"
-            if disable_web_page_preview
-            else "false",
-        }
-    ).encode("utf-8")
+
+    for attempt in range(1, _SEND_ATTEMPTS + 1):
+        try:
+            _post(url, payload)
+            return
+        except _RetryableSendError as exc:
+            if attempt == _SEND_ATTEMPTS:
+                raise RuntimeError(
+                    f"Telegram sendMessage failed after {attempt} attempts: {exc}"
+                ) from exc
+            time.sleep(exc.retry_after or _RETRY_BASE_DELAY_SECONDS * attempt)
+
+
+def _post(url: str, payload: bytes) -> None:
     request = urllib.request.Request(url, data=payload, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Telegram sendMessage failed: {exc.code} {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Telegram sendMessage failed: {exc}") from exc
+        message = f"{exc.code} {detail}"
+        if exc.code == 429 or exc.code >= 500:
+            raise _RetryableSendError(message, _retry_after(detail)) from exc
+        raise RuntimeError(f"Telegram sendMessage failed: {message}") from exc
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        raise _RetryableSendError(str(exc)) from exc
 
     result = json.loads(body)
     if not result.get("ok"):
         raise RuntimeError(f"Telegram sendMessage failed: {body}")
+
+
+def _retry_after(body: str) -> float | None:
+    try:
+        value = json.loads(body)["parameters"]["retry_after"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(value, int | float) or value <= 0:
+        return None
+    return min(float(value), _MAX_RETRY_AFTER_SECONDS)

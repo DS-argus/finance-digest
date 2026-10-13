@@ -16,25 +16,23 @@ chats:
 
 collection:
   timezone: Asia/Seoul
+  # Used only for chats without a saved cursor (first run, newly added chat).
   recent_hours: 24
   monday_weekend: true
   output_dir: data/collections
+  state_file: data/state.json
 
 summary:
   output_dir: data/reports
   provider: claude
   prompt_file: summary_prompt.yml
+  timeout_seconds: 600
   claude:
     command: claude
     model: ""
-    no_session_persistence: true
-    tools: ""
   codex:
     command: codex
     model: ""
-    sandbox: read-only
-    ephemeral: true
-    skip_git_repo_check: true
 
 send:
   telegram:

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from telethon import TelegramClient
+from telethon.errors import RPCError
 from telethon.utils import get_peer_id
 
 from finance_digest.config import AppConfig, ChatConfig, normalize_chat_identifier
@@ -60,7 +61,6 @@ async def collect_messages(
     window: CollectionWindow,
 ) -> dict[str, Any]:
     client = _build_client(config)
-    start_utc = window.start.astimezone(UTC)
     end_utc = window.end.astimezone(UTC)
 
     collection: dict[str, Any] = {
@@ -77,8 +77,16 @@ async def collect_messages(
 
     async with client:
         await client.start(phone=config.telegram_phone())
+        resolver = _ChatResolver(client)
         for chat in config.enabled_chats:
-            chat_result = await _collect_chat(client, chat, start_utc, end_utc)
+            start = window.chat_starts[chat.key]
+            try:
+                entity = await resolver.resolve(chat)
+                chat_result = await _collect_chat(client, entity, chat, start, end_utc)
+            except (RPCError, ValueError) as exc:
+                # One unreadable chat must not abort the others; its cursor stays put.
+                chat_result = _chat_result(chat, start, chat.name, [])
+                chat_result["error"] = f"{type(exc).__name__}: {exc}"
             collection["total_messages"] += chat_result["message_count"]
             collection["chats"].append(chat_result)
 
@@ -87,11 +95,12 @@ async def collect_messages(
 
 async def _collect_chat(
     client: TelegramClient,
+    entity: Any,
     chat: ChatConfig,
-    start_utc: datetime,
+    start: datetime,
     end_utc: datetime,
 ) -> dict[str, Any]:
-    entity = await _resolve_chat_entity(client, chat)
+    start_utc = start.astimezone(UTC)
     messages: list[dict[str, Any]] = []
     sender_cache: dict[int, str | None] = {}
 
@@ -127,32 +136,57 @@ async def _collect_chat(
 
     messages.reverse()
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or chat.name
+    return _chat_result(chat, start, title, messages)
+
+
+def _chat_result(
+    chat: ChatConfig,
+    start: datetime,
+    title: str,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "name": chat.name,
         "title": title,
         "identifier": str(chat.identifier),
+        "key": chat.key,
+        "start": start.isoformat(),
         "message_count": len(messages),
         "messages": messages,
     }
 
 
-async def _resolve_chat_entity(client: TelegramClient, chat: ChatConfig) -> Any:
-    identifier = normalize_chat_identifier(chat.identifier)
-    if not isinstance(identifier, int):
-        return await client.get_entity(identifier)
+class _ChatResolver:
+    """Resolve configured chats, scanning the dialog list at most once per run."""
 
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        if get_peer_id(entity) == identifier or getattr(entity, "id", None) == identifier:
+    def __init__(self, client: TelegramClient) -> None:
+        self._client = client
+        self._dialogs: dict[int, Any] | None = None
+
+    async def resolve(self, chat: ChatConfig) -> Any:
+        identifier = normalize_chat_identifier(chat.identifier)
+        if not isinstance(identifier, int):
+            return await self._client.get_entity(identifier)
+
+        if self._dialogs is None:
+            self._dialogs = {}
+            async for dialog in self._client.iter_dialogs():
+                entity = dialog.entity
+                self._dialogs.setdefault(get_peer_id(entity), entity)
+                entity_id = getattr(entity, "id", None)
+                if entity_id is not None:
+                    self._dialogs.setdefault(entity_id, entity)
+
+        entity = self._dialogs.get(identifier)
+        if entity is not None:
             return entity
-
-    raise ValueError(
-        "Could not resolve chat identifier "
-        f"{chat.identifier!r} for '{chat.name}'. "
-        "Run `uv run finance-digest chats --config config.yml --limit 500` "
-        "and copy the first column for the target chat. If the chat is missing, "
-        "open it once in Telegram and try again."
-    )
+        raise ValueError(
+            "Could not resolve chat identifier "
+            f"{chat.identifier!r} for '{chat.name}'. "
+            "Run `uv run finance-digest chats --config config.yml --limit 500` "
+            "and copy the first column for the target chat. If the chat is missing, "
+            "open it once in Telegram and try again."
+        )
 
 
 async def _safe_sender_name(message: Any) -> str | None:
@@ -196,9 +230,19 @@ def extract_links(text: str) -> list[str]:
 
 
 def _build_client(config: AppConfig) -> TelegramClient:
-    config.telegram.session_path.parent.mkdir(parents=True, exist_ok=True)
-    return TelegramClient(
-        str(config.telegram.session_path),
+    session_path = config.telegram.session_path
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    client = TelegramClient(
+        str(session_path),
         config.telegram_api_id(),
         config.telegram_api_hash(),
     )
+    # Telethon appends ".session" unless present; the file grants full account access.
+    session_file = (
+        session_path
+        if session_path.name.endswith(".session")
+        else session_path.with_name(session_path.name + ".session")
+    )
+    if session_file.exists():
+        session_file.chmod(0o600)
+    return client

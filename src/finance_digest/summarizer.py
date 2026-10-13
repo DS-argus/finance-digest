@@ -3,19 +3,45 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from finance_digest.config import AppConfig
 
-NO_MESSAGES_REPORT = """# Telegram Finance Digest
+NO_MESSAGES_REPORT = """**Daily Finance Digest**
 
 수집된 메시지가 없습니다.
 
----
 투자 조언이 아닙니다. 원문과 출처를 확인하세요.
 """
+
+# Codex features that give the model tools to run commands, read files, browse,
+# or call external apps. They are switched off with `-c features.<name>=false`
+# because, unlike `--disable`, an unknown key there only warns: a Codex release
+# that drops one of these names must not break the fallback summarizer.
+CODEX_DISABLED_FEATURES = (
+    "shell_tool",
+    "unified_exec",
+    "apps",
+    "plugins",
+    "hooks",
+    "browser_use",
+    "computer_use",
+    "image_generation",
+    "view_image",
+    "memories",
+    "skill_search",
+    "goals",
+    "tool_suggest",
+)
+
+_ERROR_TAIL_LINES = 10
+_ERROR_TAIL_CHARS = 1500
+# Codex echoes the prompt and the piped collection on stderr before its own output.
+_CODEX_STDIN_END = "</stdin>"
 
 
 def summarize_collection(config: AppConfig, collection: dict[str, Any]) -> str:
@@ -38,7 +64,7 @@ def summarize_collection(config: AppConfig, collection: dict[str, Any]) -> str:
     raise RuntimeError(f"Unsupported summary provider: {config.summary.provider}")
 
 
-def _summarize_with_claude(config: AppConfig, collection: dict[str, Any]) -> str:
+def claude_command(config: AppConfig) -> list[str]:
     claude = config.summary.claude
     cmd = [
         claude.command,
@@ -47,61 +73,137 @@ def _summarize_with_claude(config: AppConfig, collection: dict[str, Any]) -> str
         "text",
         "--input-format",
         "text",
+        "--no-session-persistence",
+        # No built-in tools and no MCP servers: the model can only read stdin.
+        "--tools",
+        "",
+        "--strict-mcp-config",
     ]
-    if claude.no_session_persistence:
-        cmd.append("--no-session-persistence")
-    if claude.tools is not None:
-        cmd.extend(["--tools", claude.tools])
     if claude.model:
         cmd.extend(["--model", claude.model])
-
-    input_text = _combined_prompt_and_collection(config.summary.prompt, collection)
-    return _run_summarizer(cmd, input_text, config, provider="claude")
+    return cmd
 
 
-def _summarize_with_codex(config: AppConfig, collection: dict[str, Any]) -> str:
+def codex_command(config: AppConfig, workdir: Path) -> list[str]:
     codex = config.summary.codex
-    cmd = [codex.command, "exec", "--color", "never"]
-    if codex.skip_git_repo_check:
-        cmd.append("--skip-git-repo-check")
-    if codex.ephemeral:
-        cmd.append("--ephemeral")
-    if codex.sandbox:
-        cmd.extend(["--sandbox", codex.sandbox])
+    cmd = [
+        codex.command,
+        "exec",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--sandbox",
+        "read-only",
+        # Drops user MCP servers, hooks and rules; auth still comes from CODEX_HOME.
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--cd",
+        str(workdir),
+        "-c",
+        'web_search="disabled"',
+    ]
+    for feature in CODEX_DISABLED_FEATURES:
+        cmd.extend(["-c", f"features.{feature}=false"])
     if codex.model:
         cmd.extend(["--model", codex.model])
     cmd.append(config.summary.prompt)
+    return cmd
 
-    return _run_summarizer(
-        cmd,
-        format_collection_markdown(collection),
-        config,
-        provider="codex",
-    )
+
+def _summarize_with_claude(config: AppConfig, collection: dict[str, Any]) -> str:
+    input_text = _combined_prompt_and_collection(config.summary.prompt, collection)
+    with tempfile.TemporaryDirectory(prefix="finance-digest-claude-") as workdir:
+        return _run_summarizer(
+            claude_command(config),
+            input_text,
+            cwd=Path(workdir),
+            timeout=config.summary.timeout_seconds,
+            provider="claude",
+        )
+
+
+def _summarize_with_codex(config: AppConfig, collection: dict[str, Any]) -> str:
+    with tempfile.TemporaryDirectory(prefix="finance-digest-codex-") as workdir:
+        return _run_summarizer(
+            codex_command(config, Path(workdir)),
+            format_collection_markdown(collection),
+            cwd=Path(workdir),
+            timeout=config.summary.timeout_seconds,
+            provider="codex",
+        )
 
 
 def _run_summarizer(
     cmd: list[str],
     input_text: str,
-    config: AppConfig,
     *,
+    cwd: Path,
+    timeout: float,
     provider: str,
 ) -> str:
     cmd = [_resolve_command(cmd[0], provider), *cmd[1:]]
-    proc = subprocess.run(
-        cmd,
-        input=input_text,
-        text=True,
-        capture_output=True,
-        cwd=config.base_dir,
-        check=False,
-    )
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip()
-        raise RuntimeError(
-            f"{provider} summarizer failed with code {proc.returncode}: {detail}"
+    # A new session makes the CLI the leader of its own process group, so a
+    # timeout can kill helper processes that would otherwise keep the pipes open.
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
         )
-    return proc.stdout.strip()
+    except OSError as exc:
+        raise RuntimeError(f"{provider} summarizer could not start: {exc}") from exc
+    try:
+        stdout, stderr = proc.communicate(input_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _abandon(proc)
+        raise RuntimeError(f"{provider} summarizer timed out after {timeout}s") from None
+    except BaseException:
+        _abandon(proc)
+        raise
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{provider} summarizer failed with code {proc.returncode}: "
+            f"{error_detail(stderr, stdout)}"
+        )
+    report = stdout.strip()
+    if not report:
+        raise RuntimeError(f"{provider} summarizer returned an empty report")
+    return report
+
+
+def error_detail(stderr: str, stdout: str) -> str:
+    """Return the tail of a failed CLI's output without the echoed collection."""
+    text = stderr.rsplit(_CODEX_STDIN_END, 1)[-1].strip() or stdout.strip()
+    tail = "\n".join(text.splitlines()[-_ERROR_TAIL_LINES:])
+    return tail[-_ERROR_TAIL_CHARS:]
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _abandon(proc: subprocess.Popen[str]) -> None:
+    """Kill the CLI's process group and reap it without reading its pipes.
+
+    communicate() would block again if a descendant that left the group still
+    holds stdout/stderr open, so the pipes are closed unread instead.
+    """
+    _kill_process_group(proc)
+    proc.wait()
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            stream.close()
 
 
 def _resolve_command(command: str, provider: str) -> str:
@@ -139,6 +241,9 @@ def format_collection_markdown(collection: dict[str, Any]) -> str:
     ]
 
     for chat in collection.get("chats", []):
+        if chat.get("error"):
+            lines.extend([f"## {chat.get('name')} (collection failed)", ""])
+            continue
         lines.extend(
             [
                 f"## {chat.get('name')} ({chat.get('message_count', 0)} messages)",
@@ -161,8 +266,29 @@ def format_collection_markdown(collection: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def append_failed_chats_notice(
+    report: str,
+    collection: dict[str, Any],
+    *,
+    retry_scheduled: bool,
+) -> str:
+    failed = [chat for chat in collection.get("chats", []) if chat.get("error")]
+    if not failed:
+        return report
+    lines = ["**수집 실패 채널**"]
+    lines.extend(f"- {chat.get('name')}: {_first_line(chat['error'])}" for chat in failed)
+    if retry_scheduled:
+        lines.append("다음 실행에서 이 채널들의 누락 구간을 다시 수집합니다.")
+    return report.rstrip() + "\n\n" + "\n".join(lines) + "\n"
+
+
 def read_collection(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _first_line(text: str, limit: int = 160) -> str:
+    line = str(text).strip().splitlines()[0] if str(text).strip() else ""
+    return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
 def _combined_prompt_and_collection(prompt: str, collection: dict[str, Any]) -> str:
