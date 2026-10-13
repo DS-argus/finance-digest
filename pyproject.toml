@@ -1,7 +1,7 @@
 [project]
 name = "finance-digest"
 version = "0.1.0"
-description = "Manual Telegram finance chat collector and Codex summarizer"
+description = "Telegram finance chat collector with Claude/Codex summaries and bot delivery"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
